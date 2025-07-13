@@ -50,6 +50,9 @@ using namespace std;
 #include "wifibroadcast.hpp"
 #include "tx.hpp"
 
+// Forward declaration for CBR functions
+static void reset_cbr_state();
+
 Transmitter::Transmitter(int k, int n, const string &keypair, uint64_t epoch, uint32_t channel_id, uint32_t fec_delay, vector<tags_item_t> &tags) : \
     fec_p(NULL), fec_k(-1), fec_n(-1),
     block_idx(0), fragment_idx(0),
@@ -644,6 +647,10 @@ bool Transmitter::send_packet(const uint8_t *buf, size_t size, uint8_t flags)
     if (block_idx > MAX_BLOCK_IDX)
     {
         init_session(fec_k, fec_n);
+
+        // Reset CBR statistics when session restarts
+        reset_cbr_state();
+
         for(int i = 0; i < fec_n - fec_k + 1; i++)
         {
             send_session_key();
@@ -668,6 +675,107 @@ uint32_t extract_rxq_overflow(struct msghdr *msg)
     return 0;
 }
 
+
+// CBR (Constant Bit Rate) enforcement parameters
+#define PACKET_BATCH 32  // Check timing every 32 packets for better granularity
+
+// CBR state tracking
+static uint64_t last_batch_ns = 0;
+static size_t accumulated_bytes = 0;
+static int packet_count = 0;
+static int mcs_index = 0;  // Global MCS index
+static int prev_mcs_index = -1;  // Track previous MCS to detect changes
+static double fec_overhead = 1.25;  // Dynamic FEC overhead derived from n/k
+
+// MCS to max bitrate mapping (in Kbps, accounting for realistic conditions)
+static double get_max_bitrate_kbps(int mcs) {
+    switch (mcs) {
+        case 0: return 4800.0;   // ~6.5 Mbps theoretical, practical ~4.8 Mbps
+        case 1: return 9200.0;   // ~13 Mbps theoretical, practical ~9.2 Mbps
+        case 2: return 13800.0;  // ~19.5 Mbps theoretical, practical ~13.8 Mbps
+        case 3: return 18400.0;  // ~26 Mbps theoretical, practical ~18.4 Mbps
+        case 4: return 27600.0;  // ~39 Mbps theoretical, practical ~27.6 Mbps
+        case 5: return 36800.0;  // ~52 Mbps theoretical, practical ~36.8 Mbps
+        case 6: return 41400.0;  // ~58.5 Mbps theoretical, practical ~41.4 Mbps
+        case 7: return 46000.0;  // ~65 Mbps theoretical, practical ~46 Mbps
+        default: return 4800.0;  // Conservative fallback
+    }
+}
+
+static uint64_t get_monotonic_time_ns() {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return ((uint64_t)ts.tv_sec * 1000000000ULL) + (uint64_t)ts.tv_nsec;
+}
+
+static void safe_nanosleep(uint64_t sleep_ns) {
+    struct timespec ts = {
+        .tv_sec = (time_t)(sleep_ns / 1000000000ULL),
+        .tv_nsec = (long)(sleep_ns % 1000000000ULL)
+    };
+
+    struct timespec rem;
+    while (nanosleep(&ts, &rem) == -1 && errno == EINTR) {
+        ts = rem;
+    }
+}
+
+static void reset_cbr_state() {
+    last_batch_ns = 0;
+    accumulated_bytes = 0;
+    packet_count = 0;
+}
+
+void maybe_wait_batch(size_t packet_len) {
+    // Check if MCS has changed - if so, reset CBR state to start fresh
+    if (mcs_index != prev_mcs_index) {
+        reset_cbr_state();
+        prev_mcs_index = mcs_index;
+    }
+
+    accumulated_bytes += packet_len;
+    packet_count++;
+
+    // Only check rate limiting after accumulating a batch of packets
+    if (packet_count < PACKET_BATCH) {
+        return;
+    }
+
+    uint64_t now_ns = get_monotonic_time_ns();
+
+    // Initialize timing on first batch
+    if (last_batch_ns == 0) {
+        last_batch_ns = now_ns;
+        accumulated_bytes = 0;
+        packet_count = 0;
+        return;
+    }
+
+    // Calculate effective bitrate accounting for FEC overhead
+    double max_bitrate_kbps = get_max_bitrate_kbps(mcs_index) / fec_overhead;
+    double elapsed_sec = (double)(now_ns - last_batch_ns) / 1e9;
+    double target_sec = (double)(accumulated_bytes * 8) / (max_bitrate_kbps * 1000.0);
+
+    // If we're transmitting faster than target rate, sleep to throttle
+    if (elapsed_sec < target_sec) {
+        double sleep_sec = target_sec - elapsed_sec;
+        uint64_t sleep_ns = (uint64_t)(sleep_sec * 1e9);
+
+        // Only sleep for significant delays (>= 1ms) to avoid excessive syscalls
+        if (sleep_ns >= 1000000ULL) {
+            safe_nanosleep(sleep_ns);
+
+            // Update timing reference after sleep
+            now_ns = get_monotonic_time_ns();
+        }
+    }
+
+    // Reset batch counters
+    last_batch_ns = now_ns;
+    accumulated_bytes = 0;
+    packet_count = 0;
+}
+
 void data_source(unique_ptr<Transmitter> &t, vector<int> &rx_fd, int control_fd, int fec_timeout, bool mirror, int log_interval)
 {
     int nfds = rx_fd.size();
@@ -685,6 +793,11 @@ void data_source(unique_ptr<Transmitter> &t, vector<int> &rx_fd, int control_fd,
     fds[nfds].fd = control_fd;
     fds[nfds].events = POLLIN;
 
+    // Initialize FEC overhead from current FEC parameters
+    int current_fec_k = 0, current_fec_n = 0;
+    t->get_fec(current_fec_k, current_fec_n);
+    fec_overhead = (double)current_fec_n / (double)current_fec_k;
+
     uint64_t session_key_announce_ts = get_time_ms();
     uint32_t rxq_overflow = 0;
     uint64_t log_send_ts = get_time_ms();
@@ -696,6 +809,7 @@ void data_source(unique_ptr<Transmitter> &t, vector<int> &rx_fd, int control_fd,
     uint32_t count_b_injected = 0;  // successfully injected bytes (include additional fec packets)
     uint32_t count_p_dropped = 0;   // dropped due to rxq overflows or injection timeout
     uint32_t count_p_truncated = 0; // injected large packets that were truncated
+
     int start_fd_idx = 0;
 
     for(;;)
@@ -804,6 +918,12 @@ void data_source(unique_ptr<Transmitter> &t, vector<int> &rx_fd, int control_fd,
 
                     t->init_session(fec_k, fec_n);
 
+                    // Update FEC overhead for CBR calculations
+                    fec_overhead = (double)fec_n / (double)fec_k;
+
+                    // Reset CBR statistics when session restarts
+                    reset_cbr_state();
+
                     // Emulate FEC for initial session key distribution
                     for(int i = 0; i < fec_n - fec_k + 1; i++)
                     {
@@ -811,7 +931,7 @@ void data_source(unique_ptr<Transmitter> &t, vector<int> &rx_fd, int control_fd,
                     }
 
                     sendto(fd, &resp, offsetof(cmd_resp_t, u), MSG_DONTWAIT, (sockaddr*)&from_addr, addr_size);
-                    WFB_INFO("Session restarted with FEC %d/%d\n", fec_k, fec_n);
+                    WFB_INFO("Session restarted with FEC %d/%d (overhead: %.2f)\n", fec_k, fec_n, fec_overhead);
                 }
                 break;
 
@@ -997,6 +1117,12 @@ void data_source(unique_ptr<Transmitter> &t, vector<int> &rx_fd, int control_fd,
                         // we yield session packets only if there are data packets
                         session_key_announce_ts = cur_ts + SESSION_KEY_ANNOUNCE_MSEC;
                     }
+
+//Here we try to apply CBR logic, not the best place, better to be inside transmitter::send_packet+
+
+                    mcs_index = t->get_radiotap_header().mcs_index;
+                    maybe_wait_batch(rsize);
+
 
                     t->send_packet(buf, rsize, 0);
 
